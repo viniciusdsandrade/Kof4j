@@ -139,7 +139,8 @@ public final class KofInterpreterRuntime {
             // do runtime gerado o chama por reflexão host ("invoke") — sem a
             // ponte o lookup falha e a rota morre em HTTP 500 no interpretador.
             if (name.equals("kof_web_route") || name.equals("kof_web_route_opts")
-                    || name.equals("kof_web_sse_route") || name.equals("kof_web_ws_route")) {
+                    || name.equals("kof_web_sse_route") || name.equals("kof_web_ws_route")
+                    || name.equals("kof_web_use")) {
                 args = args.clone();
                 for (int i = 0; i < args.length; i++) {
                     if (args[i] instanceof KofInterpreter.KofObj ko) args[i] = new InterpretedCallable(interp, ko);
@@ -258,7 +259,7 @@ public final class KofInterpreterRuntime {
      * só existem como KofObj no interpretador.
      */
     private Object decodeKofValue(IRClass c, Object parsed) throws Throwable {
-        KofInterpreter.KofObj obj = new KofInterpreter.KofObj(c);
+        KofInterpreter.KofObj obj = new KofInterpreter.KofObj(c, interp);
         if (parsed instanceof java.util.Map<?, ?> m) {
             for (IRField f : c.fields()) {
                 if (java.lang.reflect.Modifier.isStatic(f.accessFlags())) continue;

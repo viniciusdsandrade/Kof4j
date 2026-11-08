@@ -88,6 +88,17 @@ public final class SemMethodCallTyper {
             if ("atTime".equals(mc.methodName()) && n == 3)
                 return new Type.NullableType(entS);
         }
+        // TLS hardening slice 1: `web.secureHost(host, certPem, keyPem)` is a
+        // namespace call whose receiver is NOT a value — resolve it before the
+        // instance dispatch (which would type `web` as UNKNOWN and fall through
+        // to SEM015 "Undefined function"). Mirrors the emit side
+        // (MethodCallNamespaces).
+        if (mc.receiver() instanceof IdentifierExpr nsR && !SemExpressionTyper.isLocalName(scope, nsR.name())
+                && KofWeb.isWebNamespace(nsR.name())
+                && "secureHost".equals(mc.methodName()) && mc.arguments().size() == 3) {
+            for (ExpressionNode arg : mc.arguments()) SemExpressionTyper.inferType(sa, arg, scope);
+            return KofWeb.SECURE_HOST;
+        }
         // F10: métodos de instância do handle de process.spawn
         Type recv = null;
         if (mc.receiver() != null) {
@@ -411,7 +422,7 @@ public final class SemMethodCallTyper {
             case "Float", "float" -> "java/lang/Float";
             case "Double", "double" -> "java/lang/Double";
             case "Bool", "bool", "boolean", "Boolean" -> "java/lang/Boolean";
-            case "Char", "char" -> "java/lang/Character";
+            case "Char", "char", "Character" -> "java/lang/Character";
             case "Byte", "byte" -> "java/lang/Byte";
             case "Short", "short" -> "java/lang/Short";
             case "Object" -> "java/lang/Object";

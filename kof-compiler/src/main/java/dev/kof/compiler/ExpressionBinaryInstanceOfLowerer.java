@@ -47,6 +47,20 @@ final class ExpressionBinaryInstanceOfLowerer {
     // ("Bad type on operand stack") em qualquer função que monta UI.
     boolean handleAsInt = ExpressionBinaryPredicates.isIntPrimitive(targetType)
             && (KofUi.isUiType(fromCastType) || KofMedia.isHandleType(fromCastType));
+    // #1054: the narrowed nullable-primitive left's SLOT is the D-NULL-INTENT
+    // boxed reference while its SEMANTIC type is the primitive — both cast
+    // paths below must open the box before treating the stack as raw.
+    boolean slotBoxedNullablePrim = false;
+    if (bin.left() instanceof IdentifierExpr lie0) {
+        IRLocalVariable lv0 = driver.findLocalVar(lie0.name(), locals);
+        if (lv0 != null && lv0.type() instanceof Type.NullableType nt0
+                && TypeMetrics.isPrimitiveType(nt0.inner())) {
+            slotBoxedNullablePrim = true;
+            CompilerEmissionHelpers.emitNarrowedNullableUnbox(driver, ops, lv0.type(),
+                    nt0.inner());
+            fromCastType = nt0.inner();
+        }
+    }
     if ("instanceof".equals(bin.operator())) {
         ops.add(new KofInstanceOf(targetType));
     } else if (TypeMetrics.isPrimitiveType(targetType)
@@ -55,13 +69,10 @@ final class ExpressionBinaryInstanceOfLowerer {
         // NÃO checkcast (que exigiria um objeto na pilha)
         Type fromT = fromCastType;
         driver.emitWideningIfNeeded(ops, fromT, targetType);
-        if (targetType instanceof Type.PrimitiveType tp2
-                && ("char".equals(tp2.name()) || "Char".equals(tp2.name()))) {
-            ops.add(new KofUnary(KofUnaryOp.I2C, fromT));
-        }
         // narrowing numérico (cast explícito): L2I, F2I, D2I,
-        // F2L, D2L — sem isso FP→Int gerava bytecode inválido
-        // (bug 5) e Long→Int via wid().não cobria
+        // F2L, D2L + os estreitos byte/short/char (#1087: o passo
+        // largo→Int vem ANTES do i2b/i2s/i2c) — sem isso FP→Int gerava
+        // bytecode inválido (bug 5) e Long→Byte VerifyError
         driver.emitPrimNarrow(ops, fromT, targetType);
     } else {
         // bug 127: cast para TIPO-FUNÇÃO (`x as () -> Int`) — o alvo não é
@@ -126,7 +137,8 @@ final class ExpressionBinaryInstanceOfLowerer {
         // identidade no interpretador (Script) e JS (stack já boxed) — o
         // CHECKCAST de cima fica redundante (mesmo alvo, inofensivo).
         if (TypeMetrics.isPrimitiveType(targetType)
-                && !TypeMetrics.isPrimitiveType(fromCastType) && !handleAsInt) {
+                && (!TypeMetrics.isPrimitiveType(fromCastType) || slotBoxedNullablePrim)
+                && !handleAsInt) {
             // kof_unbox: JVM faz CHECKCAST(boxed)+INVOKEVIRTUAL unboxMethod
             // com descriptor "()" + toDescriptor(returnType). Char é guardado
             // BOXED como Integer (§104b-ii): o return tem que ser INT (senão

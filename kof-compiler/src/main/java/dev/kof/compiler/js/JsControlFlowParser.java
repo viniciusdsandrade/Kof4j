@@ -1,4 +1,5 @@
 package dev.kof.compiler.js;
+import dev.kof.compiler.KofCall;
 import dev.kof.compiler.KofCatchStart;
 import dev.kof.compiler.KofCheckCast;
 import dev.kof.compiler.KofComparison;
@@ -9,6 +10,7 @@ import dev.kof.compiler.KofLabel;
 import dev.kof.compiler.KofLoadLocal;
 import dev.kof.compiler.KofOperation;
 import dev.kof.compiler.KofPop;
+import dev.kof.compiler.KofPop2;
 import dev.kof.compiler.KofReturn;
 import dev.kof.compiler.KofReturnVoid;
 import dev.kof.compiler.KofStatementIf;
@@ -112,6 +114,24 @@ List<JsIr.JsStatement> parseStatements(MethodCtx ctx, int[] pos,
                 }
                 // region exit (if/try/finally jump)
                 pos[0]++;
+                // #975: com um laço vivo, um salto cujo alvo fica DEPOIS do
+                // fim do laço mais interno é um break-out — o jump-threading
+                // do IR re-taxa o `break` para o fim do `if` envolvente
+                // quando o Label(end) do laço e o Label(if-end) ficam
+                // adjacentes e vazios. Consumi-lo como region exit genérico
+                // DESCARTAVA o break: o laço JS rodava até o fim (a JVM
+                // parava) — ou o Label residual estourava COMP002. O
+                // `break;` sai do laço; o fluxo de fora segue no bloco alvo
+                // naturalmente.
+                if (!ctx.loops.isEmpty()) {
+                    LabelId innerEnd = ctx.loops.get(ctx.loops.size() - 1).end;
+                    int loopEndPos = labelPos(ctx, innerEnd);
+                    int exitPos = labelPos(ctx, kj.target());
+                    if (loopEndPos >= 0 && (exitPos < 0 || exitPos > loopEndPos)) {
+                        out.add(new JsIr.JsBreak());
+                        return out;
+                    }
+                }
                 exits.add(kj.target());
                 return out;
             }
@@ -128,6 +148,14 @@ List<JsIr.JsStatement> parseStatements(MethodCtx ctx, int[] pos,
             out.addAll(parseStatement(ctx, pos));
         }
         return out;
+    }
+
+    /** Posição do KofLabel no stream de ops; -1 se ausente. */
+    private int labelPos(MethodCtx ctx, LabelId label) {
+        for (int i = 0; i < ctx.ops.size(); i++) {
+            if (ctx.ops.get(i) instanceof KofLabel kl && kl.label().equals(label)) return i;
+        }
+        return -1;
     }
 
     /**
@@ -472,6 +500,10 @@ JsIr.JsStatement parseDoWhile(MethodCtx ctx, int[] pos, LabelId startLabel,
             if (isDoWhileConditionAhead(ctx, pos, startLabel)) {
                 break;
             }
+            if (ctx.ops.get(pos[0]) instanceof KofLabel kl && JsLabelParser.isLoopStart(ctx, pos, kl.label())) {
+                body.add(parseLoop(ctx, pos, kl.label()));
+                continue;
+            }
             body.addAll(parseStatement(ctx, pos));
         }
         ctx.loops.remove(ctx.loops.size() - 1);
@@ -521,7 +553,8 @@ JsIr.JsStatement parseDoWhile(MethodCtx ctx, int[] pos, LabelId startLabel,
             }
             if (op instanceof KofStoreLocal || op instanceof KofLabel
                     || op instanceof KofJump || op instanceof KofReturn
-                    || op instanceof KofReturnVoid || op instanceof KofThrow) {
+                    || op instanceof KofReturnVoid || op instanceof KofThrow
+                    || endsStatement(op)) {
                 return false;
             }
             if (!p.expr.isExpressionOp(op)) return false;
@@ -539,7 +572,8 @@ JsIr.JsStatement parseDoWhile(MethodCtx ctx, int[] pos, LabelId startLabel,
             // last assignment), a label, a jump or a return.
             if (op instanceof KofStoreLocal || op instanceof KofLabel
                     || op instanceof KofJump || op instanceof KofReturn
-                    || op instanceof KofReturnVoid || op instanceof KofThrow) {
+                    || op instanceof KofReturnVoid || op instanceof KofThrow
+                    || endsStatement(op)) {
                 return false;
             }
             if (!p.expr.isExpressionOp(op)) {
@@ -547,6 +581,11 @@ JsIr.JsStatement parseDoWhile(MethodCtx ctx, int[] pos, LabelId startLabel,
             }
         }
         return false;
+    }
+
+    private static boolean endsStatement(KofOperation op) {
+        return op instanceof KofPop || op instanceof KofPop2
+                || (op instanceof KofCall kc && Type.isVoid(kc.returnType()));
     }
 
 }

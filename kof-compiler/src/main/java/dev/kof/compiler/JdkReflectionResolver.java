@@ -1,6 +1,7 @@
 package dev.kof.compiler;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.TypeVariable;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.List;
@@ -11,12 +12,12 @@ import java.util.List;
  * <p>Resolve issues #237 (§234: String.join com interface/concreto), #231 (§224:
  * StringBuilder.append com retorno da classe concreta), etc.
  */
-final class JdkReflectionResolver {
+public final class JdkReflectionResolver {
 
     private JdkReflectionResolver() {}
 
     /** Verifica se o nome interno pertence a um pacote padrão do JDK. */
-    static boolean isJdkClass(String internalName) {
+    public static boolean isJdkClass(String internalName) {
         if (internalName == null) return false;
         return internalName.startsWith("java/")
                 || internalName.startsWith("javax/")
@@ -43,7 +44,7 @@ final class JdkReflectionResolver {
     /**
      * Resolve a assinatura real do método no JDK usando reflexão.
      */
-    static ExternalClasspath.MethodSignature resolveJdkMethod(String ownerInternalName,
+    public static ExternalClasspath.MethodSignature resolveJdkMethod(String ownerInternalName,
                                                               String methodName,
                                                               int argumentCount) {
         return resolveJdkMethodWithArgs(ownerInternalName, methodName, argumentCount, null);
@@ -95,6 +96,16 @@ final class JdkReflectionResolver {
                                 score += 10;
                             } else if (isCompatiblePrimitiveBox(p, a)) {
                                 score += 8;
+                            } else if (p == Object.class) {
+                                // #1124 fatia 2: o param apagado de `of(T)` é
+                                // Object — primitivo NUNCA passava
+                                // (Object.isAssignableFrom(int.class) é false,
+                                // primitivo não é Class) e a fábrica nem
+                                // resolvia. Object aceita qualquer argumento
+                                // (referência direta, primitivo via boxing
+                                // JLS) com o MENOR score: uma sobrecarga
+                                // específica continua vencendo.
+                                score += 2;
                             } else {
                                 compatible = false;
                                 break;
@@ -158,12 +169,156 @@ final class JdkReflectionResolver {
      * builtin precisa — `resolveJdkMethod` exige `getParameterCount() == argc`
      * e por isso não vê varargs.
      */
+    /**
+     * #1032 — o tipo de retorno REAL de um método JDK, para a decisão de
+     * statement-level POP. TRUE = devolve valor (um POP); FALSE = void (nenhum
+     * POP); null = não resolve (o chamador cai no fallback semântico). Por
+     * ARIDADE apenas — os conversores de ArrayType/Unknown perdiam matches.
+     */
+    static Boolean statementReturn(String ownerInternalName, String methodName, int argumentCount) {
+        ExternalClasspath.MethodSignature sig =
+                resolveJdkMethod(ownerInternalName, methodName, argumentCount);
+        if (sig == null) return null;
+        return !sig.returnDescriptor().startsWith("V");
+    }
+
+    /**
+     * #1032 — a variante usada pelo gate de statement: lê o tipo do receiver
+     * DIRETO do slot IR (o tipo semântico é Unknown para um `new` externo não
+     * resolvido) e devolve o retorno real do JDK, ou null quando o receiver
+     * não é java.* ou o método não resolve.
+     */
+    static Boolean statementReturnFor(IdentifierExpr rid, CompilerDriver driver,
+                                      List<IRLocalVariable> locals, MethodCallExpr mc) {
+        IRLocalVariable lv = driver.findLocalVar(rid.name(), locals);
+        if (lv == null || !(lv.type() instanceof Type.ClassType rct)
+                || !rct.packageName().startsWith("java.")) {
+            return null;
+        }
+        return statementReturn(rct.packageName().replace('.', '/') + "/" + rct.name(),
+                mc.methodName(), mc.arguments().size());
+    }
+
+    /**
+     * #1124 — o retorno GENÉRICO de um método JDK, substituído pelos type
+     * arguments do receiver. {@code get()} em {@code Optional<String>} é
+     * {@code String} (o argumento), não {@code Object} (a erasure).
+     *
+     * <p>Pareamento POSICIONAL: a TypeVariable do retorno é procurada pelos
+     * parâmetros de tipo da classe DECLARANTE; o índice casa com o type
+     * argument do receiver {@code ClassType} no mesmo índice. Devolve null
+     * quando o retorno não é uma TypeVariable de nível topo, o receiver não
+     * carrega type arguments, ou a aridade de tipo não casa — o chamador
+     * mantém o tipo apagado (mudança zero para faces não genéricas). Fadiga
+     * de escopo: ParameterizedType aninhado (ex. {@code Stream<T>}) e
+     * substituição dirigida por argumento (fábricas {@code of(T)}) ficam
+     * para as fatias seguintes — nunca inventar tipo sem pareamento provado.
+     */
+    public static Type genericReturnFor(String ownerInternalName, String methodName,
+                                 int argumentCount, List<Type> receiverTypeArgs) {
+        if (!isJdkClass(ownerInternalName) || receiverTypeArgs == null
+                || receiverTypeArgs.isEmpty()) {
+            return null;
+        }
+        try {
+            Class<?> cls = Class.forName(ownerInternalName.replace('/', '.'));
+            TypeVariable<?>[] ownerParams = cls.getTypeParameters();
+            if (ownerParams.length != receiverTypeArgs.size()) return null;
+            for (Method m : cls.getMethods()) {
+                if (!m.getName().equals(methodName)) continue;
+                if (m.getParameterCount() != argumentCount) continue;
+                if (m.isBridge()) continue;
+                java.lang.reflect.Type ret = m.getGenericReturnType();
+                if (!(ret instanceof TypeVariable<?> tv)) return null;
+                Class<?> decl = m.getDeclaringClass();
+                TypeVariable<?>[] declParams = decl.getTypeParameters();
+                for (int i = 0; i < declParams.length; i++) {
+                    if (declParams[i].getName().equals(tv.getName())
+                            && i < receiverTypeArgs.size()) {
+                        return receiverTypeArgs.get(i);
+                    }
+                }
+                return null;
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * #1124 fatia 2 — retorno de FÁBRICA estática genérica substituído pelo
+     * ARGUMENTO: {@code Optional.of("hi")} é {@code Optional<String>}.
+     *
+     * <p>Forma reconhecida (tudo ou nada — nunca inventar tipo): o retorno
+     * genérico é um ParameterizedType cujo raw é a própria classe dona, com
+     * EXATAMENTE UMA TypeVariable entre os argumentos de tipo; essa
+     * TypeVariable aparece como tipo de nível topo de EXATAMENTE UM parâmetro;
+     * e o argumento nessa posição é um ClassType de REFERÊNCIA com type
+     * arguments VAZIOS (String, classes simples — primitivo, Nullable, array e
+     * genérico profundo mantêm o retorno CRU: o box/desbox e o cast aninhado
+     * são faces próprias, não desta fatia). Qualquer outra forma devolve
+     * null — o chamador fica com a erasure (mudança zero).
+     */
+    public static Type genericReturnFromArgs(String ownerInternalName, String methodName,
+                                             int argumentCount, List<Type> argumentTypes,
+                                             Type receiverType) {
+        if (!isJdkClass(ownerInternalName) || argumentTypes == null
+                || argumentTypes.size() != argumentCount
+                || !(receiverType instanceof Type.ClassType rc)) {
+            return null;
+        }
+        try {
+            Class<?> cls = Class.forName(ownerInternalName.replace('/', '.'));
+            for (Method m : cls.getMethods()) {
+                if (!m.getName().equals(methodName)) continue;
+                if (m.getParameterCount() != argumentCount) continue;
+                if (m.isBridge()) continue;
+                java.lang.reflect.Type ret = m.getGenericReturnType();
+                if (!(ret instanceof java.lang.reflect.ParameterizedType pt)
+                        || pt.getRawType() != cls) {
+                    return null;
+                }
+                java.lang.reflect.Type[] typeArgs = pt.getActualTypeArguments();
+                int tvPos = -1;
+                for (int i = 0; i < typeArgs.length; i++) {
+                    if (typeArgs[i] instanceof TypeVariable<?> tv) {
+                        if (tvPos >= 0) return null;
+                        tvPos = i;
+                    } else if (!(typeArgs[i] instanceof Class<?>)) {
+                        return null;
+                    }
+                }
+                if (tvPos < 0) return null;
+                String tvName = ((TypeVariable<?>) typeArgs[tvPos]).getName();
+                int paramPos = -1;
+                java.lang.reflect.Type[] genParams = m.getGenericParameterTypes();
+                for (int i = 0; i < genParams.length; i++) {
+                    if (genParams[i] instanceof TypeVariable<?> tv
+                            && tv.getName().equals(tvName)) {
+                        if (paramPos >= 0) return null;
+                        paramPos = i;
+                    }
+                }
+                if (paramPos < 0) return null;
+                Type arg = argumentTypes.get(paramPos);
+                if (!(arg instanceof Type.ClassType act) || !act.typeArguments().isEmpty()) {
+                    return null;
+                }
+                return new Type.ClassType(rc.packageName(), rc.name(), List.of(arg));
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        return null;
+    }
+
     static boolean hasJdkMethod(String ownerInternalName, String methodName, int argumentCount) {
         if (!isJdkClass(ownerInternalName)) return false;
         try {
             Class<?> cls = Class.forName(ownerInternalName.replace('/', '.'));
             for (Method m : cls.getMethods()) {
-                if (!m.getName().equals(methodName)) continue;
+                if (!m.getName().equals(methodName) || !Modifier.isStatic(m.getModifiers())) continue;
                 int pc = m.getParameterCount();
                 if (pc == argumentCount) return true;
                 if (m.isVarArgs() && argumentCount >= pc - 1) return true;
